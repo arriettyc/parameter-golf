@@ -95,28 +95,39 @@ class Hyperparameters:
 
 @torch.compile
 def fused_muon_op(grads, momentum_buffers, lr, momentum, nesterov, backend_steps):
+    """
+    Full-graph compiled Muon operator.
+    Processes all parameters of the same shape at once using 3D Batch Matrix Multiply.
+    """
+    # Update momentum
     momentum_buffers.mul_(momentum).add_(grads)
     if nesterov:
         updates = grads.add(momentum_buffers, alpha=momentum)
     else:
         updates = momentum_buffers
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    norms = updates.view(updates.size(0), -1).norm(dim=1).view(-1, 1, 1)
-    X = updates.bfloat16() / (norms + 1e-7)
-    if X.size(1) > X.size(2):
-        X = X.transpose(1, 2)
-        needs_transpose = True
-    else:
-        needs_transpose = False
 
+    # Batch Newton-Schulz
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    
+    # Normalize each 2D matrix in the batch
+    # updates shape: (N, H, W)
+    norms = updates.reshape(updates.size(0), -1).norm(dim=1).view(-1, 1, 1)
+    X = updates.bfloat16() / (norms + 1e-7)
+    
+    # Determine if we need to transpose the whole batch
+    transposed = X.size(1) > X.size(2)
+    if transposed:
+        X = X.transpose(1, 2)
+
+    # Fast Newton-Schulz iteration
     for _ in range(backend_steps):
-        A = torch.bmm(X, X.transpose(1, 2)) # Batch Matrix Multiply
+        A = torch.bmm(X, X.transpose(1, 2)) 
         B = b * A + c * torch.bmm(A, A)
         X = a * X + torch.bmm(B, X)
     
-    if needs_transpose:
+    if transposed:
         X = X.transpose(1, 2)
-
+        
     X *= max(1, X.size(1) / X.size(2)) ** 0.5
     return X
 
@@ -125,7 +136,7 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov)
         super().__init__(params, defaults)
         
-        # tiling
+        # Group parameters by shape to allow 3D stacking (Tiling)
         self.param_groups_by_shape = {}
         for group in self.param_groups:
             for p in group['params']:
@@ -135,26 +146,54 @@ class Muon(torch.optim.Optimizer):
                 self.param_groups_by_shape[shape].append(p)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        
         for shape, params in self.param_groups_by_shape.items():
             active_params = [p for p in params if p.grad is not None]
             if not active_params: continue
             
             group = self.param_groups[0]
+            device = active_params[0].device
+            
+            # Stack gradients and buffers into 3D Tensors
             grads = torch.stack([p.grad for p in active_params])
+            
             if 'momentum_buffer' not in self.state[active_params[0]]:
                 for p in active_params:
                     self.state[p]['momentum_buffer'] = torch.zeros_like(p)
             
             moms = torch.stack([self.state[p]['momentum_buffer'] for p in active_params])
+            
+            # Use torch.tensor for scalars to prevent Dynamo recompilation
+            lr_t = torch.tensor(group['lr'], device=device)
+            momentum_t = torch.tensor(group['momentum'], device=device)
+
+            # The Fused Operation
             updates = fused_muon_op(
                 grads, moms, 
-                group['lr'], group['momentum'], 
-                group['nesterov'], group['backend_steps']
+                lr_t, momentum_t, 
+                group['nesterov'], 
+                group['backend_steps']
             )
+
+            # Distributed synchronization (Overlap optimization)
+            if distributed:
+                dist.all_reduce(updates, op=dist.ReduceOp.SUM)
+                updates.div_(dist.get_world_size())
+
+            # Write back results
             for i, p in enumerate(active_params):
+                # Update the original state buffers from the stack
                 self.state[p]['momentum_buffer'].copy_(moms[i])
                 p.add_(updates[i].to(p.dtype), alpha=-group['lr'])
+
+        return loss
 
 
 # -----------------------------
@@ -883,6 +922,42 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+
+    # ---- PERF METRICS (MFU) SETUP ----
+    PERF_METRICS = int(os.environ.get("PERF_METRICS", "0")) == 1
+
+    def _peak_bf16_tflops(dev: torch.device) -> float:
+        name = torch.cuda.get_device_name(dev).upper()
+        props = torch.cuda.get_device_properties(dev)
+
+        if "H100" in name:
+            return 989e12 if "SXM" in name else 756e12
+        if "6000 ADA" in name or "RTX 6000 ADA" in name:
+            return 91.1e12
+        
+        raise ValueError(
+            f"Unsupported GPU detected: {name}. "
+            "This script is strictly configured for H100 or RTX 6000 Ada."
+        )
+
+    if PERF_METRICS:
+        gpu_peak_flops = _peak_bf16_tflops(device)
+        kv_ratio = args.num_kv_heads / args.num_heads
+        # FLOPs per token per layer (forward): Q/K/V projections + SDPA + out-proj + MLP
+        flops_per_token_fwd = args.num_layers * (
+            (4 + 4 * kv_ratio + 4 * args.mlp_mult) * args.model_dim * args.model_dim
+            + 4 * args.train_seq_len * args.model_dim
+        )
+
+        # Use local batch tokens per GPU instead of the global cluster batch size
+        local_batch_tokens = args.train_batch_tokens // world_size
+        flops_per_step_per_gpu = 3 * local_batch_tokens * flops_per_token_fwd
+        
+        log0(
+            f"perf_metrics:enabled gpu={torch.cuda.get_device_name(device)} "
+            f"peak_bf16_tflops:{gpu_peak_flops/1e12:.1f} flops_per_step_per_gpu:{flops_per_step_per_gpu:.3e}"
+        )
+
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -924,6 +999,7 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        log0(f"warming up xinnnn.....")
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -955,6 +1031,10 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    if PERF_METRICS:
+        _step_start_event = torch.cuda.Event(enable_timing=True)
+        _step_end_event = torch.cuda.Event(enable_timing=True)
+        _last_step_ms: float = 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -996,6 +1076,8 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+        if PERF_METRICS:
+            _step_start_event.record()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
@@ -1020,6 +1102,8 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if PERF_METRICS:
+            _step_end_event.record()
         zero_grad_all()
 
         step += 1
@@ -1029,10 +1113,21 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-            )
+            if PERF_METRICS:
+                _step_end_event.synchronize()
+                _last_step_ms = _step_start_event.elapsed_time(_step_end_event)
+                mfu = flops_per_step_per_gpu / (_last_step_ms * 1e-3 * gpu_peak_flops)
+                
+                log0(
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                    f"mfu:{mfu:.3f} step_ms:{_last_step_ms:.1f}ms"
+                )
+            else:
+                log0(
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

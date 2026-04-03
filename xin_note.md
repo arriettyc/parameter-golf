@@ -25,7 +25,7 @@ Then copy to your local machine and open in Nsight Systems GUI:
 
 
 # on your local machine
-scp xin@192.168.4.105:~/parameter-golf/logs/baseline_sp1024_v2.nsys-rep ./
+scp xin@workstation:~/parameter-golf/logs/baseline_sp1024_v2.nsys-rep ./
 
 
 
